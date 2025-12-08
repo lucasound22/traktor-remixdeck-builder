@@ -1,156 +1,170 @@
-# streamlit_app.py
 import streamlit as st
-import librosa
-from pydub import AudioSegment, effects
-from pathlib import Path
-import tempfile, shutil, json, os
 import numpy as np
+from pydub import AudioSegment
+import librosa
+import soundfile as sf
+import zipfile
+import io
+import os
+import tempfile
 
-st.set_page_config(page_title="Traktor RemixDeck Builder — MVP", layout="wide")
-st.markdown("<h1 style='color:#00bfff;'>Traktor RemixDeck Builder — MVP</h1>", unsafe_allow_html=True)
-st.write("This MVP performs: upload → BPM detection → kick-aligned (approx) loop slicing → MP3 320 export → ZIP download.")
+# -----------------------------------------------------------
+# PAGE CONFIG
+# -----------------------------------------------------------
+st.set_page_config(
+    page_title="Traktor RemixDeck Builder",
+    page_icon="🎧",
+    layout="wide"
+)
 
-st.sidebar.header("Loop & Export Settings")
-bars = st.sidebar.slider("Loop bars", 1, 64, 8)
-fade_ms = st.sidebar.slider("Fade (ms)", 0, 500, 40)
-overlap = st.sidebar.slider("Overlap (%)", 0, 50, 0)
-include_oneshots = st.sidebar.checkbox("Detect one-shots (simple)", value=True)
-oneshot_threshold = st.sidebar.slider("One-shot dBFS threshold", -60, -10, -35)
+# -----------------------------------------------------------
+# CUSTOM TRAKTOR UI THEME
+# -----------------------------------------------------------
+st.markdown("""
+<style>
 
-uploaded = st.file_uploader("Upload MP3 or WAV (single file)", type=["mp3","wav"])
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap');
 
-def detect_bpm_and_kicks(path):
-    y, sr = librosa.load(str(path), sr=None, mono=True)
-    tempo, beats = librosa.beat.beat_track(y=y, sr=sr)
-    # simple kick-ish detection via onset envelope (approx)
-    onset_env = librosa.onset.onset_strength(y=y, sr=sr, aggregate=np.median)
-    peaks = librosa.util.peak_pick(onset_env, pre_max=3, post_max=3, pre_avg=3, post_avg=3, delta=0.02, wait=3)
-    kick_times = librosa.frames_to_time(peaks, sr=sr)
-    return float(tempo), np.array(kick_times), y, sr
+html, body, [class*="css"] {
+    font-family: 'Inter', sans-serif !important;
+    background-color: #0E0E0E !important;
+}
 
-def slice_loops(audio_segment, kick_times, bars, bpm, fade_ms, overlap_pct):
-    beat = 60.0/float(bpm)
-    loop_dur = bars * 4 * beat
-    step = loop_dur * (1 - overlap_pct/100.0)
-    loops = []
-    t = 0.0
-    while t + 0.5 < audio_segment.duration_seconds:
-        # snap to first kick after t if available
-        future = kick_times[kick_times >= t] if len(kick_times)>0 else np.array([])
-        t0 = float(future[0]) if len(future)>0 else t
-        t1 = t0 + loop_dur
-        if t1 > audio_segment.duration_seconds:
-            break
-        seg = audio_segment[int(t0*1000):int(t1*1000)]
-        if fade_ms>0:
-            seg = seg.fade_in(fade_ms).fade_out(fade_ms)
-        loops.append({"start": t0, "end": t1, "audio": seg})
-        t += step
-    return loops
+h1, h2, h3, h4 {
+    color: #0A84FF !important;
+    font-weight: 700 !important;
+    letter-spacing: -0.5px;
+}
 
-def detect_one_shots(path, threshold_db=-35, max_ms=600):
-    y, sr = librosa.load(str(path), sr=None, mono=True)
-    onset_times = librosa.onset.onset_detect(y=y, sr=sr, units='time', backtrack=False)
-    audio = AudioSegment.from_file(str(path))
-    shots = []
-    for t in onset_times:
-        start_ms = max(0, int(t*1000 - 20))
-        clip = audio[start_ms:start_ms+max_ms]
-        try:
-            if clip.dBFS >= threshold_db:
-                shots.append({"time": t, "audio": clip})
-        except Exception:
-            continue
-    return shots
+.stFileUploader, .stButton > button {
+    background-color: #1A1A1A !important;
+    border: 1px solid #0A84FF !important;
+    color: white !important;
+    padding: 8px 14px;
+    border-radius: 6px;
+}
 
-def ensure_dir(p:Path):
-    p.mkdir(parents=True, exist_ok=True)
+.stSlider > div > div {
+    background: #0A84FF !important;
+}
 
-def export_deck(out_dir:Path, loops, one_shots, bpm, metadata_extra):
-    ensure_dir(out_dir)
-    metadata = {"bpm": bpm, "loops": [], "one_shots": [], "extra": metadata_extra}
-    # export loops
-    for i, L in enumerate(loops, start=1):
-        fn = out_dir / f"loop_{i:02d}.mp3"
-        L["audio"].export(fn, format="mp3", bitrate="320k")
-        metadata["loops"].append({"file": str(fn.name), "start": L["start"], "end": L["end"]})
-    for i, S in enumerate(one_shots, start=1):
-        fn = out_dir / f"shot_{i:02d}.mp3"
-        S["audio"].export(fn, format="mp3", bitrate="320k")
-        metadata["one_shots"].append({"file": str(fn.name), "time": S["time"]})
-    with open(out_dir / "metadata.json","w") as f:
-        json.dump(metadata, f, indent=2)
-    return metadata
+.stAlert {
+    background-color: #000 !important;
+    border-left: 3px solid #0A84FF !important;
+}
 
-if uploaded:
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmp = Path(tmpdir)
-        track_path = tmp / uploaded.name
-        track_path.write_bytes(uploaded.getbuffer())
+.block-container {
+    padding-top: 2rem !important;
+}
 
-        st.info(f"Loaded: {uploaded.name} — analyzing...")
-        try:
-            tempo, kick_times, y, sr = detect_bpm_and_kicks(track_path)
-        except Exception as e:
-            st.error(f"Error analyzing audio: {e}")
-            st.stop()
-        st.success(f"Detected approximate BPM: {tempo:.2f}")
+</style>
+""", unsafe_allow_html=True)
 
-        # create pydub segment
-        audio_seg = AudioSegment.from_file(str(track_path))
-        with st.spinner("Slicing loops..."):
-            loops = slice_loops(audio_seg, kick_times, bars=bars, bpm=tempo, fade_ms=fade_ms, overlap_pct=overlap)
-        st.write(f"Generated {len(loops)} loops. Preview below.")
+# -----------------------------------------------------------
+# TITLE
+# -----------------------------------------------------------
+st.title("Traktor RemixDeck Builder by Tuesdaynightfreak Productions")
+st.write("Upload any MP3/WAV → BPM detect → auto slice → MP3 export → ZIP download.")
 
-        if include_oneshots:
-            with st.spinner("Detecting one-shots..."):
-                shots = detect_one_shots(track_path, threshold_db=oneshot_threshold)
-            st.write(f"Detected {len(shots)} one-shots (approx).")
-        else:
-            shots = []
 
-        # Preview grid
-        st.subheader("Loop previews")
-        cols = st.columns(4)
-        for i, L in enumerate(loops):
-            fn = tmp / f"preview_loop_{i+1}.mp3"
-            L["audio"].export(fn, format="mp3", bitrate="320k")
-            with cols[i%4]:
-                st.audio(str(fn))
-                st.caption(f"Loop {i+1} — {L['start']:.2f}s to {L['end']:.2f}s")
+# -----------------------------------------------------------
+# AUDIO LOADER (FFMPEG SAFE)
+# -----------------------------------------------------------
+def load_audio(file):
+    """Load audio using pydub with ffmpeg support."""
+    suffix = file.name.split(".")[-1].lower()
 
-        if shots:
-            st.subheader("One-shot previews")
-            cols2 = st.columns(6)
-            for i, S in enumerate(shots):
-                fn = tmp / f"preview_shot_{i+1}.mp3"
-                S["audio"].export(fn, format="mp3", bitrate="320k")
-                with cols2[i%6]:
-                    st.audio(str(fn))
-                    st.caption(f"Shot {i+1} — {S['time']:.2f}s")
+    with tempfile.NamedTemporaryFile(delete=False, suffix=f".{suffix}") as tmp:
+        tmp.write(file.read())
+        tmp_path = tmp.name
 
-        # Export deck
-        st.markdown("---")
-        deck_name = st.text_input("Deck name for export", value=uploaded.name.split(".")[0] + "_RemixDeck")
-        export_btn = st.button("Export Remix Deck ZIP (MP3 320)")
-        if export_btn:
-            out_dir = tmp / deck_name
-            out_dir.mkdir(exist_ok=True)
-            meta = {"bpm": tempo, "loops": [], "one_shots": []}
-            for i, L in enumerate(loops, start=1):
-                fn = out_dir / f"loop_{i:02d}.mp3"
-                L["audio"].export(fn, format="mp3", bitrate="320k")
-                meta["loops"].append({"file": fn.name, "start": L["start"], "end": L["end"]})
-            for i, S in enumerate(shots, start=1):
-                fn = out_dir / f"shot_{i:02d}.mp3"
-                S["audio"].export(fn, format="mp3", bitrate="320k")
-                meta["one_shots"].append({"file": fn.name, "time": S["time"]})
-            # write metadata
-            with open(out_dir / "metadata.json","w") as f:
-                json.dump(meta, f, indent=2)
-            # zip
-            zip_path = tmp / (deck_name + ".zip")
-            shutil.make_archive(str(zip_path).replace('.zip',''), 'zip', out_dir)
-            with open(str(zip_path), "rb") as fh:
-                st.download_button("Download Remix Deck ZIP", fh.read(), file_name=deck_name + ".zip")
-            st.success("Export ready. Download the ZIP and copy into Traktor or a USB drive.")
+    audio = AudioSegment.from_file(tmp_path)
+    os.remove(tmp_path)
+    return audio
+
+
+# -----------------------------------------------------------
+# BPM DETECTION
+# -----------------------------------------------------------
+def detect_bpm(y, sr):
+    tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
+    return tempo
+
+
+# -----------------------------------------------------------
+# AUTO SLICING
+# -----------------------------------------------------------
+def slice_audio(audio, slice_ms):
+    chunks = []
+    for start in range(0, len(audio), slice_ms):
+        end = min(start + slice_ms, len(audio))
+        chunks.append(audio[start:end])
+    return chunks
+
+
+# -----------------------------------------------------------
+# EXPORT CHUNKS INTO ZIP
+# -----------------------------------------------------------
+def export_zip(chunks, bpm):
+    buffer = io.BytesIO()
+
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as z:
+        for i, chunk in enumerate(chunks):
+            temp_path = f"slice_{i+1}.mp3"
+            chunk.export(temp_path, format="mp3", bitrate="320k")
+            z.write(temp_path)
+            os.remove(temp_path)
+
+        # Add metadata
+        z.writestr("info.txt", f"Generated BPM: {bpm}")
+
+    buffer.seek(0)
+    return buffer
+
+
+# -----------------------------------------------------------
+# FILE UPLOAD
+# -----------------------------------------------------------
+uploaded_file = st.file_uploader("Drag & drop your MP3 or WAV here", type=["mp3", "wav"])
+
+if uploaded_file:
+    st.info(f"Loaded: **{uploaded_file.name}** — analyzing...")
+
+    # Load audio
+    audio = load_audio(uploaded_file)
+
+    # Convert to numpy for analysis
+    samples = np.array(audio.get_array_of_samples()).astype(np.float32)
+    samples /= np.iinfo(audio.array_type).max
+    sr = audio.frame_rate
+
+    # BPM
+    bpm = detect_bpm(samples, sr)
+    st.success(f"Detected approximate BPM: **{bpm:.2f}**")
+
+    # Slice size selector
+    col1, col2 = st.columns(2)
+    with col1:
+        slice_bars = st.slider("Loop bars", 1, 16, 4)
+    with col2:
+        st.write(" ")
+
+    slice_ms = int((60_000 / bpm) * slice_bars)
+
+    st.write(f"Each slice = **{slice_bars} bars** ({slice_ms} ms)")
+
+    # Process
+    if st.button("Build Remix Deck ZIP"):
+        st.info("Processing slices...")
+
+        chunks = slice_audio(audio, slice_ms)
+        bundle = export_zip(chunks, bpm)
+
+        st.success("Your remix deck ZIP is ready!")
+        st.download_button(
+            label="⬇ Download Remix Deck ZIP",
+            data=bundle,
+            file_name="traktor-remixdeck.zip",
+            mime="application/zip"
+        )
+
