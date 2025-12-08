@@ -1,32 +1,31 @@
 # app.py
 """
-Traktor RemixDeck Builder by Tuesdaynightfreak Productions
-Theme: Traktor-like dark (club purple / techno)
-Logo: Circular DJ Wheel (SVG)
-Features:
- - Robust BPM detection (safe fallbacks)
- - Kick-aligned loop slicing (approx)
- - One-shot detection (onset-based)
- - MP3 export (320k) + ZIP download
- - Polished Traktor-inspired UI (Inter font, purple theme)
-NOTE: pydub requires ffmpeg/ffprobe. On Streamlit Cloud add 'ffmpeg' to packages.txt.
+Fixed & polished Traktor RemixDeck Builder (Streamlit)
+- Robust BPM detection (no formatting TypeErrors)
+- Safe CSS injection (no stray CSS interpreted as Python)
+- Traktor-style dark purple / techno theme + SVG logo (Circular DJ Wheel)
+- Uses in-memory audio playback (st.audio) for Streamlit-host compatibility
+- Exports Remix Deck ZIP (mp3 320k) containing loops, one-shots, and metadata.json
+IMPORTANT: Ensure `ffmpeg` is provisioned in the environment (add `ffmpeg` to packages.txt on Streamlit Cloud).
 """
 
 import streamlit as st
 import numpy as np
 import librosa
 from pydub import AudioSegment
-import tempfile, shutil, json, io, os, zipfile
+import io, zipfile, json, tempfile, shutil, os
 from pathlib import Path
 
-# ---------------------------
-# Page config + theme CSS
-# ---------------------------
+# ----------------------------
+# Page config
+# ----------------------------
 st.set_page_config(page_title="Traktor RemixDeck Builder", page_icon="🎧", layout="wide")
 
-# Inline SVG logo (Circular DJ Wheel - Logo A)
+# ----------------------------
+# CSS + SVG Logo (safe string)
+# ----------------------------
 SVG_LOGO = r'''
-<svg width="148" height="148" viewBox="0 0 148 148" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Traktor RemixDeck Builder logo">
+<svg width="96" height="96" viewBox="0 0 148 148" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Logo">
   <defs>
     <radialGradient id="g" cx="50%" cy="40%">
       <stop offset="0%" stop-color="#5be0ff"/>
@@ -40,122 +39,70 @@ SVG_LOGO = r'''
   <g filter="url(#s)">
     <circle cx="74" cy="74" r="66" fill="url(#g)"/>
     <circle cx="74" cy="74" r="46" fill="#0e0e0e"/>
-    <!-- center platter -->
     <circle cx="74" cy="74" r="18" fill="#111111" stroke="#2a2a2a" stroke-width="2"/>
-    <!-- groove rings -->
     <g stroke="#151515" stroke-opacity="0.4" stroke-width="1">
       <circle cx="74" cy="74" r="32" fill="none"/>
       <circle cx="74" cy="74" r="38" fill="none"/>
     </g>
-    <!-- stylized notch markers -->
     <g transform="rotate(0 74 74)" fill="#a8d8ff" opacity="0.95">
       <rect x="72" y="8" width="4" height="12" rx="2"/>
       <rect x="72" y="128" width="4" height="12" rx="2"/>
     </g>
-    <g transform="rotate(45 74 74)" fill="#8ad1ff" opacity="0.85">
-      <rect x="72" y="8" width="4" height="10" rx="2"/>
-    </g>
-    <g transform="rotate(90 74 74)" fill="#6fc1ff" opacity="0.75">
-      <rect x="72" y="8" width="4" height="8" rx="2"/>
-    </g>
-    <!-- play indicator -->
     <polygon points="86,74 66,84 66,64" fill="#00f0ff" opacity="0.9"/>
   </g>
 </svg>
 '''
 
-# Dark purple / techno CSS and layout
 st.markdown(
-    f"""
-    <style>
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap');
+    """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap');
 
-    html, body, [class*="css"]  {{
-        font-family: 'Inter', sans-serif !important;
-        background: linear-gradient(180deg, #0b0711 0%, #0f0820 45%, #15072b 100%) fixed !important;
-        color: #e6eef8;
-    }}
+html, body, [class*="css"] {
+  font-family: 'Inter', sans-serif !important;
+  background: linear-gradient(180deg, #0b0711 0%, #0f0820 45%, #15072b 100%) fixed !important;
+  color: #e6eef8;
+}
 
-    /* Header area */
-    .header {{
-        display:flex;
-        align-items:center;
-        gap:18px;
-        padding: 16px 8px;
-    }}
-    .app-title {{
-        font-size:36px;
-        font-weight:700;
-        color: #34c0ff;
-        margin:0;
-        letter-spacing:-0.6px;
-    }}
-    .app-sub {{
-        color:#cfefff;
-        opacity:0.9;
-        margin-top:4px;
-        font-weight:400;
-    }}
+/* Header */
+.header { display:flex; align-items:center; gap:18px; padding:18px 6px; }
+.app-title { font-size:32px; font-weight:700; color:#34c0ff; margin:0; letter-spacing:-0.6px; }
+.app-sub { color:#cfefff; opacity:0.95; margin-top:4px; font-weight:400; font-size:14px; }
 
-    /* uploader card */
-    .uploader {{
-        background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01));
-        border: 1px solid rgba(67,120,255,0.08);
-        padding:14px;
-        border-radius:10px;
-    }}
+/* Uploader card */
+.uploader { background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01)); border: 1px solid rgba(67,120,255,0.08); padding:12px; border-radius:10px; }
 
-    /* Button styles */
-    .stButton > button {
-        background: linear-gradient(90deg,#0a84ff,#2aa6ff) !important;
-        color: #041827 !important;
-        font-weight:600;
-        border: none !important;
-        box-shadow: 0 6px 18px rgba(10,132,255,0.12);
-        padding:10px 16px;
-        border-radius:8px;
-    }
+/* Buttons */
+.stButton > button {
+  background: linear-gradient(90deg,#0a84ff,#2aa6ff) !important;
+  color:#041827 !important;
+  font-weight:600;
+  border-radius:8px;
+  padding:8px 14px;
+  border: none !important;
+  box-shadow: 0 6px 18px rgba(10,132,255,0.12);
+}
 
-    /* small output boxes */
-    .stAlert {
-        border-left: 4px solid #34c0ff !important;
-        background: rgba(12,16,24,0.6) !important;
-        color: #d8f3ff !important;
-    }
+/* Alerts */
+.stAlert { border-left: 4px solid #34c0ff !important; background: rgba(12,16,24,0.6) !important; color: #d8f3ff !important; }
 
-    /* footer */
-    .footer {
-        margin-top:36px;
-        padding:28px;
-        border-radius:12px;
-        background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01));
-        border: 1px solid rgba(255,255,255,0.03);
-        display:flex;
-        align-items:center;
-        justify-content:space-between;
-        gap:12px;
-    }
-    .footer .left { color:#bfe9ff; }
-    .footer .right { opacity:0.85; color:#d9f1ff; }
+/* Footer */
+.footer { margin-top:28px; padding:18px; border-radius:10px; background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01)); border: 1px solid rgba(255,255,255,0.03); display:flex; align-items:center; justify-content:space-between; gap:12px; color:#bfe9ff; }
 
-    /* responsive preview grid */
-    .preview-grid { display:grid; grid-template-columns: repeat(auto-fill,minmax(240px,1fr)); gap:12px; }
-
-    /* small captions */
-    .caption { color:#9fcff6; font-size:13px; opacity:0.95; }
-
-    </style>
-    """,
+.preview-grid { display:grid; grid-template-columns: repeat(auto-fill,minmax(240px,1fr)); gap:12px; margin-top:12px; }
+.caption { color:#9fcff6; font-size:13px; opacity:0.95; margin-top:6px; }
+</style>
+""",
     unsafe_allow_html=True,
 )
 
-# ---------------------------
-# Header / Logo
-# ---------------------------
+# ----------------------------
+# Header content
+# ----------------------------
 st.markdown(
     f"""
     <div class="header">
-      <div style="width:82px;height:82px">{SVG_LOGO}</div>
+      <div style="width:92px; height:92px">{SVG_LOGO}</div>
       <div>
         <div class="app-title">Traktor RemixDeck Builder</div>
         <div class="app-sub">by Tuesdaynightfreak Productions — Upload • Analyze • Slice • Export</div>
@@ -165,54 +112,45 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.write("")  # spacer
+# ----------------------------
+# Controls layout
+# ----------------------------
+left, right = st.columns([1, 2], gap="large")
 
-# ---------------------------
-# Controls (left column)
-# ---------------------------
-left_col, right_col = st.columns([1, 2])
-
-with left_col:
-    st.markdown("<div class='uploader'>", unsafe_allow_html=True)
-    uploaded_file = st.file_uploader("Drag & drop your MP3 or WAV here", type=["mp3", "wav"])
+with left:
+    st.markdown('<div class="uploader">', unsafe_allow_html=True)
+    uploaded = st.file_uploader("Drag & drop your MP3 or WAV here", type=["mp3", "wav"])
     st.caption("Limit: 200MB per file • MP3, WAV")
     st.markdown("</div>", unsafe_allow_html=True)
 
     st.markdown("### Slice Settings")
-    bars = st.slider("Loop bars", min_value=1, max_value=32, value=4, help="Number of 4/4 bars per loop (4 bars = 1 phrase commonly).")
+    bars = st.slider("Loop bars (4/4 bars)", min_value=1, max_value=32, value=4)
     fade_ms = st.slider("Fade (ms)", min_value=0, max_value=500, value=40)
     overlap = st.slider("Overlap (%)", min_value=0, max_value=50, value=0)
     detect_shots = st.checkbox("Detect one-shots (onset-based)", value=True)
     shot_thresh = st.slider("One-shot loudness threshold (dBFS)", -60, -10, value=-35)
 
     st.markdown("---")
-    st.markdown("**Export**")
-    export_name = st.text_input("Deck name", value="MyRemixDeck")
-    out_format = st.selectbox("Export format", ["mp3 (320k)"], index=0)  # future: wav option
-    st.markdown("---")
-    st.caption("Tip: Add 'ffmpeg' to packages.txt if deploying to Streamlit Cloud (pydub needs it).")
+    st.markdown("**Export settings**")
+    deck_name = st.text_input("Deck name", value="MyRemixDeck")
+    st.caption("Note: On Streamlit Cloud add 'ffmpeg' to packages.txt for pydub to work.")
 
-# ---------------------------
-# Helper functions
-# ---------------------------
+# ----------------------------
+# Helper functions (robust)
+# ----------------------------
 def robust_detect_bpm(y, sr):
-    """
-    Try multiple ways to detect BPM and return a float.
-    Falls back to 128 BPM if detection fails.
-    """
     try:
-        tempo, beats = librosa.beat.beat_track(y=y, sr=sr)
+        tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
         if tempo is None or np.isnan(tempo):
-            raise ValueError("beat_track returned invalid tempo")
+            raise ValueError("invalid tempo")
         tempo = float(tempo)
-        # common half/double corrections heuristic:
-        if tempo < 65:
+        # simple heuristics for half/double-time
+        if tempo < 60:
             tempo *= 2.0
         if tempo > 220:
             tempo /= 2.0
         return tempo
     except Exception:
-        # try onset autocorrelation fallback
         try:
             onset_env = librosa.onset.onset_strength(y=y, sr=sr)
             ac = np.correlate(onset_env, onset_env, mode='full')
@@ -224,16 +162,10 @@ def robust_detect_bpm(y, sr):
                     return float(bpm_est)
         except Exception:
             pass
-    # ultimate fallback
     return 128.0
 
 def detect_kicks(y, sr):
-    """
-    Simple kick / onset detection using low-frequency onset strength.
-    Returns array of times (seconds).
-    """
     try:
-        # compute onset strength using spectral band emphasizing low freq
         onset_env = librosa.onset.onset_strength(y=y, sr=sr, aggregate=np.median)
         peaks = librosa.util.peak_pick(onset_env, pre_max=3, post_max=3, pre_avg=3, post_avg=3, delta=0.02, wait=3)
         times = librosa.frames_to_time(peaks, sr=sr)
@@ -245,39 +177,29 @@ def snap_to_next_kick(t, kicks):
     if kicks.size == 0:
         return t
     future = kicks[kicks >= t]
-    if future.size > 0:
-        return float(future[0])
-    return float(kicks[-1])  # last kick
+    return float(future[0]) if future.size > 0 else float(kicks[-1])
 
-def slice_kick_aligned(audio_segment: AudioSegment, y, sr, bars, bpm, fade_ms, overlap_pct):
-    """
-    Slice the audio into loops that start on the nearest kick after the intended grid position.
-    Returns list of dicts: {'start': sec, 'end': sec, 'audio': AudioSegment}
-    """
+def slice_kick_aligned(audio_segment, y, sr, bars, bpm, fade_ms, overlap_pct):
     beat_dur = 60.0 / float(bpm)
-    loop_dur_sec = bars * 4 * beat_dur
-    step = loop_dur_sec * (1 - overlap_pct / 100.0)
+    loop_dur = bars * 4 * beat_dur
+    step = loop_dur * (1 - overlap_pct / 100.0)
     kicks = detect_kicks(y, sr)
     loops = []
     t = 0.0
-    # guard: create minimal slices even if kick detection bad
+    # guard for safety: minimum loops if kicks empty
     while t + 0.5 < audio_segment.duration_seconds:
         t0 = snap_to_next_kick(t, kicks)
-        t1 = t0 + loop_dur_sec
+        t1 = t0 + loop_dur
         if t1 > audio_segment.duration_seconds:
             break
         seg = audio_segment[int(t0 * 1000): int(t1 * 1000)]
         if fade_ms > 0:
             seg = seg.fade_in(fade_ms).fade_out(fade_ms)
-        loops.append({"start": t0, "end": t1, "audio": seg})
+        loops.append({"start": float(t0), "end": float(t1), "audio": seg})
         t += step
     return loops
 
 def detect_one_shots(path, threshold_db=-35, max_ms=600):
-    """
-    Onset-based one-shot detection on the full mix;
-    returns list of dicts: {'time': sec, 'audio': AudioSegment}
-    """
     try:
         y, sr = librosa.load(str(path), sr=None, mono=True)
         onset_times = librosa.onset.onset_detect(y=y, sr=sr, units='time', backtrack=False)
@@ -290,88 +212,71 @@ def detect_one_shots(path, threshold_db=-35, max_ms=600):
                 if clip.dBFS >= threshold_db:
                     shots.append({"time": float(t), "audio": clip})
             except Exception:
-                # silent clip or other invalid; skip
                 continue
         return shots
     except Exception:
         return []
 
-def export_deck_zip(loops, shots, bpm, deck_name="RemixDeck"):
-    """
-    Export loops and one-shots into a zip file (in-memory) with metadata.json
-    """
-    memfile = io.BytesIO()
-    with zipfile.ZipFile(memfile, mode="w", compression=zipfile.ZIP_DEFLATED) as z:
-        # loops
-        metadata = {"bpm": float(bpm), "loops": [], "one_shots": []}
+def export_zip_stream(loops, shots, bpm, deck_name="RemixDeck"):
+    mem = io.BytesIO()
+    with zipfile.ZipFile(mem, mode="w", compression=zipfile.ZIP_DEFLATED) as z:
+        meta = {"bpm": float(bpm), "loops": [], "one_shots": []}
+        # loops to zip
         for i, L in enumerate(loops, start=1):
-            fname = f"loops/loop_{i:02d}.mp3"
-            # export to temporary file because pydub export requires filename
-            tmpf = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
-            tmpf.close()
-            L["audio"].export(tmpf.name, format="mp3", bitrate="320k")
-            z.write(tmpf.name, arcname=fname)
-            os.unlink(tmpf.name)
-            metadata["loops"].append({"file": fname, "start": L["start"], "end": L["end"]})
-        # one-shots
+            buf = io.BytesIO()
+            L["audio"].export(buf, format="mp3", bitrate="320k")
+            z.writestr(f"loops/loop_{i:02d}.mp3", buf.getvalue())
+            meta["loops"].append({"file": f"loops/loop_{i:02d}.mp3", "start": L["start"], "end": L["end"]})
+        # shots
         for i, S in enumerate(shots, start=1):
-            fname = f"oneshots/shot_{i:02d}.mp3"
-            tmpf = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
-            tmpf.close()
-            S["audio"].export(tmpf.name, format="mp3", bitrate="320k")
-            z.write(tmpf.name, arcname=fname)
-            os.unlink(tmpf.name)
-            metadata["one_shots"].append({"file": fname, "time": S["time"]})
-        # metadata.json
-        z.writestr("metadata.json", json.dumps(metadata, indent=2))
-    memfile.seek(0)
-    return memfile
+            buf = io.BytesIO()
+            S["audio"].export(buf, format="mp3", bitrate="320k")
+            z.writestr(f"oneshots/shot_{i:02d}.mp3", buf.getvalue())
+            meta["one_shots"].append({"file": f"oneshots/shot_{i:02d}.mp3", "time": S["time"]})
+        z.writestr("metadata.json", json.dumps(meta, indent=2))
+    mem.seek(0)
+    return mem
 
-# ---------------------------
-# Main processing
-# ---------------------------
-with right_col:
-    st.markdown("<div class='uploader'>", unsafe_allow_html=True)
-    st.write(" ")
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    if not uploaded_file:
-        st.info("Upload an MP3 or WAV file using the panel on the left to begin.")
+# ----------------------------
+# Main: process uploaded file
+# ----------------------------
+with right:
+    if not uploaded:
+        st.info("Upload an MP3/WAV on the left to start analysis.")
         st.stop()
 
-    # Save uploaded file to a temp path (pydub + librosa friendly)
+    # Save uploaded to a safe temp file for analysis & pydub
     tmpdir = tempfile.mkdtemp(prefix="trk_")
     try:
-        ext = Path(uploaded_file.name).suffix.lower()
+        ext = Path(uploaded.name).suffix.lower()
         safe_path = Path(tmpdir) / ("upload" + ext)
         with open(safe_path, "wb") as f:
-            f.write(uploaded_file.getbuffer())
+            f.write(uploaded.getbuffer())
 
-        st.info(f"Loaded: **{uploaded_file.name}** — analyzing...")
+        st.info(f"Loaded: **{uploaded.name}** — analyzing...")
 
-        # librosa analysis for BPM and kicks
+        # Attempt librosa load; fallback to pydub->numpy if needed
         try:
             y, sr = librosa.load(str(safe_path), sr=None, mono=True)
-        except Exception as e:
-            st.error(f"Error reading audio for analysis: {e}")
-            # attempt pydub->librosa fallback
+        except Exception:
             try:
                 audio_pd = AudioSegment.from_file(str(safe_path))
                 samples = np.array(audio_pd.get_array_of_samples()).astype(np.float32)
                 sr = audio_pd.frame_rate
                 samples = samples / np.iinfo(audio_pd.array_type).max
                 y = samples
-            except Exception as e2:
-                st.error(f"Fatal audio load error: {e2}")
+            except Exception as err:
+                st.error(f"Error reading audio: {err}")
                 raise
 
+        # BPM robust detection
         bpm = robust_detect_bpm(y, sr)
         st.success(f"Detected approximate BPM: **{bpm:.2f}**")
 
-        # pydub segment for slicing & export
+        # Use pydub for slicing
         audio_segment = AudioSegment.from_file(str(safe_path))
 
-        # Slicing
+        # Generate loops
         with st.spinner("Generating kick-aligned loops..."):
             loops = slice_kick_aligned(audio_segment, y, sr, bars=bars, bpm=bpm, fade_ms=fade_ms, overlap_pct=overlap)
         st.write(f"Generated **{len(loops)}** loops.")
@@ -384,48 +289,50 @@ with right_col:
         else:
             shots = []
 
-        # Preview grid
+        # Previews using st.audio (in-memory)
         st.markdown("### Loop preview")
         if len(loops) == 0:
-            st.warning("No loops generated — try reducing loop bars or uploading a longer track.")
+            st.warning("No loops created — try shorter loop bars or a longer track.")
         else:
-            grid_html = "<div class='preview-grid'>"
+            # render a neat preview grid
+            cols = st.columns(3)
             for i, L in enumerate(loops):
-                # export small preview mp3 to temp file for playback
-                tmpf = Path(tmpdir) / f"preview_loop_{i+1:02d}.mp3"
-                L["audio"].export(str(tmpf), format="mp3", bitrate="192k")
-                grid_html += f"<div><audio controls src='file://{str(tmpf)}'></audio><div class='caption'>Loop {i+1} — {L['start']:.2f}s → {L['end']:.2f}s</div></div>"
-            grid_html += "</div>"
-            st.markdown(grid_html, unsafe_allow_html=True)
+                buf = io.BytesIO()
+                L["audio"].export(buf, format="mp3", bitrate="192k")
+                buf.seek(0)
+                with cols[i % 3]:
+                    st.audio(buf.read(), format="audio/mp3")
+                    st.markdown(f"<div class='caption'>Loop {i+1} — {L['start']:.2f}s → {L['end']:.2f}s</div>", unsafe_allow_html=True)
 
         if shots:
             st.markdown("### One-shot preview")
-            grid_html = "<div class='preview-grid'>"
+            cols = st.columns(4)
             for i, S in enumerate(shots):
-                tmpf = Path(tmpdir) / f"preview_shot_{i+1:02d}.mp3"
-                S["audio"].export(str(tmpf), format="mp3", bitrate="192k")
-                grid_html += f"<div><audio controls src='file://{str(tmpf)}'></audio><div class='caption'>Shot {i+1} — {S['time']:.2f}s</div></div>"
-            grid_html += "</div>"
-            st.markdown(grid_html, unsafe_allow_html=True)
+                buf = io.BytesIO()
+                S["audio"].export(buf, format="mp3", bitrate="192k")
+                buf.seek(0)
+                with cols[i % 4]:
+                    st.audio(buf.read(), format="audio/mp3")
+                    st.markdown(f"<div class='caption'>Shot {i+1} — {S['time']:.2f}s</div>", unsafe_allow_html=True)
 
-        # Export
+        # Export to ZIP
         st.markdown("---")
         if st.button("Build Remix Deck ZIP"):
             st.info("Exporting deck — packaging MP3s and metadata...")
-            deck_zip = export_deck_zip(loops, shots, bpm, deck_name=export_name)
+            zip_stream = export_zip_stream(loops, shots, bpm, deck_name=deck_name)
             st.success("Export ready — download below.")
-            st.download_button("⬇ Download Remix Deck ZIP", data=deck_zip.getvalue(), file_name=f"{export_name}.zip", mime="application/zip")
+            st.download_button("⬇ Download Remix Deck ZIP", data=zip_stream.getvalue(), file_name=f"{deck_name}.zip", mime="application/zip")
 
     finally:
-        # cleanup tempdir after user interaction (do not delete when testing in dev!)
+        # Attempt cleanup (keep it tolerant for Cloud)
         try:
             shutil.rmtree(tmpdir)
         except Exception:
             pass
 
-# ---------------------------
-# Footer (visual club-style)
-# ---------------------------
+# ----------------------------
+# Footer
+# ----------------------------
 st.markdown(
     """
     <div class="footer">
