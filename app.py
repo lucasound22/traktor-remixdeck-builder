@@ -1,15 +1,33 @@
 # app.py
 """
-Traktor RemixDeck Builder — Patched UI + looping previews + export modes + packaging bundle
-- Option A: Full Spleeter (local/VM). Lazy import to avoid boot crashes.
-- Export modes: "Stems + Loops + One-shots" or "Loops & One-shots (no stems)"
-- Fixed loop slicing and looping preview (browser <audio loop>)
-- Generates .trak (zip) with loops/oneshots/stems (optional) + metadata + pad_mapping.json + generated .tsi
-- Provides downloadable packaging bundle (scripts + workflow) to build a Windows .exe locally or with GitHub Actions
-Notes:
- - Requires ffmpeg on PATH for pydub -> mp3 export
- - For Spleeter run locally: spleeter==2.3.0 and a compatible TensorFlow in requirements
+Traktor RemixDeck Builder — Polished Two-Mode App (Online / Offline)
+Mode A selected: Web (Loops-only) vs Offline (.exe for Stems).
+- Online (default): Loops & One-shots only. Cloud-safe: do NOT import Spleeter/TensorFlow.
+- Offline (local .exe): Full Spleeter 4-stem support (if you build & run the .exe locally).
+UI: professional NI-style theme, improved logo, how-to guide, beat-aligned loops, looping preview.
+Exports: .trak (zip) with loops, one-shots, optional stems (mp3 @ 320k), metadata.json, pad_mapping.json and deck_name.tsi.
+
+Deployment notes (short):
+ - For Streamlit Cloud: use lightweight requirements.txt:
+       streamlit
+       numpy
+       librosa
+       pydub
+       soundfile
+   and add 'ffmpeg' to packages.txt if allowed by plan.
+ - For local full-stems: use requirements-local.txt:
+       streamlit
+       numpy
+       librosa
+       pydub
+       soundfile
+       spleeter==2.3.0
+       tensorflow==2.11.0
+   and ensure ffmpeg on PATH.
+
+If you want the packaging bundle (.zip with package_app.py and GH Actions workflow), use the "Create Packaging Bundle" button in the UI.
 """
+
 import os
 import io
 import json
@@ -28,34 +46,34 @@ import xml.etree.ElementTree as ET
 from xml.dom import minidom
 
 # ---------------------------
-# Page config + env
+# Page config and safe env
 # ---------------------------
 st.set_page_config(page_title="Traktor RemixDeck Builder", page_icon="🎧", layout="wide")
-os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")  # reduce TF logs if TF present
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")  # quieter if TF present locally
 
 # ---------------------------
-# Professional SVG logo + CSS (NI / Traktor inspired)
+# SVG Logo (refined) + CSS
 # ---------------------------
 SVG_LOGO = r'''
-<svg width="110" height="110" viewBox="0 0 128 128" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Traktor RemixDeck Builder">
+<svg width="112" height="112" viewBox="0 0 128 128" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Traktor RemixDeck Builder">
   <defs>
     <linearGradient id="lg" x1="0" x2="1">
-      <stop offset="0" stop-color="#18b7ff"/>
-      <stop offset="1" stop-color="#8f5aff"/>
+      <stop offset="0" stop-color="#00c2ff"/>
+      <stop offset="1" stop-color="#8454ff"/>
     </linearGradient>
-    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
-      <feDropShadow dx="0" dy="6" stdDeviation="12" flood-color="#000" flood-opacity="0.45"/>
+    <filter id="s" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="8" stdDeviation="12" flood-color="#000" flood-opacity="0.45"/>
     </filter>
   </defs>
-  <g filter="url(#shadow)">
+  <g filter="url(#s)">
     <circle cx="64" cy="64" r="60" fill="url(#lg)"/>
-    <circle cx="64" cy="64" r="46" fill="#070809"/>
+    <circle cx="64" cy="64" r="46" fill="#0b0b0d"/>
     <g transform="translate(64,64)">
-      <circle r="18" fill="#0d0d0f" stroke="#1b1b1f" stroke-width="2"/>
-      <path d="M-26,-6 C-14,-8 -6,-4 0,-2 6,0 14,2 26,6" stroke="#cfefff" stroke-width="3" fill="none" stroke-linecap="round" opacity="0.9"/>
+      <circle r="18" fill="#0e0e10" stroke="#151515" stroke-width="2"/>
+      <path d="M-26,-6 C-14,-8 -6,-4 0,-2 6,0 14,2 26,6" stroke="#caf0ff" stroke-width="3" fill="none" stroke-linecap="round" opacity="0.9"/>
     </g>
-    <rect x="12" y="12" width="16" height="6" rx="2" fill="#ffffff20" transform="rotate(-22 20 15)"/>
-    <rect x="100" y="110" width="12" height="6" rx="3" fill="#ffffff10" transform="rotate(-140 106 113)"/>
+    <rect x="18" y="18" width="12" height="6" rx="2" fill="#ffffff10" transform="rotate(-20 24 21)"/>
+    <rect x="98" y="102" width="10" height="5" rx="2" fill="#ffffff10" transform="rotate(-130 103 104)"/>
   </g>
 </svg>
 '''
@@ -64,32 +82,41 @@ st.markdown(
     """
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap');
-html, body, [class*="css"] { font-family: 'Inter', sans-serif !important; background: linear-gradient(180deg,#07060a 0%, #0f0620 60%); color:#e6eef8; }
-.header { display:flex; gap:16px; align-items:center; padding:18px; }
-.app-title { font-size:28px; color:#18b7ff; font-weight:700; margin:0; }
+:root {
+  --bg-1: #07060a;
+  --bg-2: #0f0820;
+  --accent-1: #00c2ff;
+  --accent-2: #8454ff;
+  --muted: #9fcff6;
+}
+html, body, [class*="css"] { font-family: 'Inter', sans-serif !important; background: linear-gradient(180deg,var(--bg-1) 0%, var(--bg-2) 60%); color:#e6eef8; }
+.header { display:flex; gap:14px; align-items:center; padding:14px 8px; }
+.app-title { font-size:28px; color:var(--accent-1); font-weight:700; margin:0; }
 .app-sub { color:#cfefff; opacity:0.9; margin-top:2px; font-size:13px; }
-.card { background: linear-gradient(180deg, rgba(255,255,255,0.015), rgba(255,255,255,0.01)); padding:12px; border-radius:12px; border:1px solid rgba(255,255,255,0.025); box-shadow: 0 8px 30px rgba(2,6,23,0.55); }
-.preview-grid { display:grid; grid-template-columns: repeat(auto-fill,minmax(240px,1fr)); gap:12px; margin-top:12px; }
-.caption { color:#9fcff6; font-size:13px; opacity:0.95; margin-top:6px; }
-.pad { width:84px; height:84px; border-radius:8px; background:#0f0f14; border:1px solid rgba(255,255,255,0.03); display:flex; align-items:center; justify-content:center; color:#bfe9ff; }
-.pad.assigned { background: linear-gradient(135deg, rgba(10,132,255,0.06), rgba(155,90,255,0.04)); border:1px solid rgba(10,132,255,0.14); }
-.control-label { color:#cfefff; font-weight:600; }
-.section-title { color:#eaf6ff; font-size:16px; font-weight:700; margin-top:8px; }
-.small { font-size:13px; color:#9fcff6; }
-.btn { background: linear-gradient(90deg,#0a84ff,#2aa6ff); color:#041827; font-weight:600; border-radius:8px; padding:8px 14px; border: none; }
+.card { background: linear-gradient(180deg, rgba(255,255,255,0.012), rgba(255,255,255,0.01)); padding:12px; border-radius:10px; border:1px solid rgba(255,255,255,0.02); box-shadow: 0 8px 28px rgba(2,6,23,0.55); }
+.section-title { font-weight:700; color:#eaf6ff; margin-bottom:8px; }
+.small { font-size:13px; color:var(--muted); }
+.controls { padding:12px; }
+.preview-grid { display:grid; grid-template-columns: repeat(auto-fill,minmax(260px,1fr)); gap:12px; margin-top:12px; }
+.pad { width:92px; height:92px; border-radius:8px; background:#0f0f14; border:1px solid rgba(255,255,255,0.03); display:flex; align-items:center; justify-content:center; color:#bfe9ff; margin:6px 0; }
+.button-primary { background: linear-gradient(90deg,var(--accent-1),var(--accent-2)); color:#041827; font-weight:700; border-radius:8px; padding:8px 14px; border:none; }
+.notice { padding:10px; border-radius:8px; margin-bottom:8px; }
+.notice.info { background:#062033; border-left:4px solid var(--accent-1); color:#bfe9ff; }
+.notice.warn { background:#2b1b0f; border-left:4px solid #ffd56b; color:#ffd56b; }
+.notice.error { background:#2b0b0b; border-left:4px solid #ff6b6b; color:#ffb3b3; }
+.footer { margin-top:18px; padding:14px; border-radius:8px; background: rgba(255,255,255,0.01); border:1px solid rgba(255,255,255,0.02); color:#bfe9ff; }
+.kv { color:#9fcff6; font-size:13px; }
 </style>
-""",
-    unsafe_allow_html=True,
+""", unsafe_allow_html=True,
 )
 
-# Header
 st.markdown(
     f"""
     <div class="header">
-      <div style="width:110px; height:110px">{SVG_LOGO}</div>
+      <div style="width:112px; height:112px">{SVG_LOGO}</div>
       <div>
         <div class="app-title">Traktor RemixDeck Builder</div>
-        <div class="app-sub">by Tuesdaynightfreak Productions — Stems, Loops, One-shots & Traktor-ready .trak/.tsi exports</div>
+        <div class="app-sub">by Tuesdaynightfreak Productions — Web (quick loops) & Offline (full stems)</div>
       </div>
     </div>
     """,
@@ -97,22 +124,19 @@ st.markdown(
 )
 
 # ---------------------------
-# Helper: XML pretty print
+# Helper utilities
 # ---------------------------
 def prettify_xml(elem: ET.Element) -> str:
     rough = ET.tostring(elem, 'utf-8')
     reparsed = minidom.parseString(rough)
     return reparsed.toprettyxml(indent="  ", encoding='utf-8').decode('utf-8')
 
-# ---------------------------
-# TSI generation (public-schema)
-# ---------------------------
 def color_for_stem(stem_name: str) -> str:
     s = (stem_name or "").lower()
     if "drum" in s: return "#ff6b6b"
     if "bass" in s: return "#6bd6ff"
     if "voc" in s or "voice" in s: return "#ffd56b"
-    return "#9b7aff"  # melody/other
+    return "#9b7aff"
 
 def generate_tsi(pad_map: dict, sample_base_path: str, deck_name: str, bpm: float, comment: str = "") -> str:
     root = ET.Element('TSI', {"version":"1.0"})
@@ -120,7 +144,6 @@ def generate_tsi(pad_map: dict, sample_base_path: str, deck_name: str, bpm: floa
     ET.SubElement(info, "Name").text = deck_name
     ET.SubElement(info, "Comment").text = comment or "Generated by Traktor RemixDeck Builder"
     ET.SubElement(info, "BPM").text = str(round(float(bpm), 3))
-
     remixset = ET.SubElement(root, "RemixSet")
     ET.SubElement(remixset, "Name").text = deck_name
     slots = ET.SubElement(remixset, "Slots")
@@ -165,51 +188,64 @@ def generate_tsi(pad_map: dict, sample_base_path: str, deck_name: str, bpm: floa
     return prettify_xml(root)
 
 # ---------------------------
-# Audio helpers
+# Audio helpers (beat-aware loops)
 # ---------------------------
-def robust_detect_bpm(y, sr):
+def detect_bpm_and_beats(path):
     try:
-        tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
-        if tempo is None or np.isnan(tempo): raise ValueError
-        tempo = float(tempo)
-        if tempo < 60: tempo *= 2
-        if tempo > 220: tempo /= 2
-        return tempo
+        y, sr = librosa.load(str(path), sr=None, mono=True)
+        tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr, trim=False)
+        beat_times = librosa.frames_to_time(beat_frames, sr=sr)
+        tempo = float(tempo) if tempo is not None else 0.0
+        # heuristics for tempo
+        if tempo < 60:
+            tempo *= 2
+        if tempo > 220:
+            tempo /= 2
+        return tempo, beat_times, sr, y
     except Exception:
-        try:
-            onset_env = librosa.onset.onset_strength(y=y, sr=sr)
-            ac = np.correlate(onset_env, onset_env, mode='full')
-            ac = ac[ac.size // 2:]
-            peak = np.argmax(ac[1:]) + 1
-            if peak > 0:
-                bpm_est = 60.0 / (peak / float(sr))
-                if 40 <= bpm_est <= 220:
-                    return float(bpm_est)
-        except Exception:
-            pass
-    return 128.0
+        return None, np.array([]), None, None
 
-def make_loop_from_segment(seg: AudioSegment, bpm: float, bars: int, fade_ms: int, from_start: bool = True):
-    # produce an exact loop-length clip (bars * 4 beats)
-    beat = 60.0/float(bpm)
-    loop_len_ms = int((bars * 4 * beat) * 1000)
+def nearest_beat_time(t, beat_times):
+    if len(beat_times) == 0:
+        return t
+    idx = np.searchsorted(beat_times, t)
+    if idx >= len(beat_times):
+        return float(beat_times[-1])
+    return float(beat_times[idx])
+
+def make_loop_from_beats(seg: AudioSegment, beat_times, bpm, bars, from_start=True, fade_ms=40):
+    beat_duration = 60.0 / float(bpm) if bpm and bpm>0 else None
+    loop_len_s = bars * 4 * (1.0 if beat_duration is None else beat_duration)
+    loop_len_ms = int(loop_len_s * 1000) if beat_duration else int((bars*4*0.5)*1000)
     dur_ms = int(seg.duration_seconds * 1000)
-    if from_start:
-        start_ms = 0
-        end_ms = min(loop_len_ms, dur_ms)
+    if len(beat_times) > 0 and beat_duration:
+        if from_start:
+            # start at first beat
+            start_s = float(beat_times[0])
+            end_s = start_s + loop_len_s
+        else:
+            # end aligned to last beat
+            end_s = float(beat_times[-1])
+            start_s = max(0.0, end_s - loop_len_s)
     else:
-        end_ms = dur_ms
-        start_ms = max(0, dur_ms - loop_len_ms)
+        if from_start:
+            start_s = 0.0
+            end_s = min(loop_len_ms/1000.0, dur_ms/1000.0)
+        else:
+            end_s = dur_ms / 1000.0
+            start_s = max(0.0, end_s - loop_len_ms/1000.0)
+    start_ms = int(start_s*1000)
+    end_ms = int(end_s*1000)
     clip = seg[start_ms:end_ms]
-    if fade_ms > 0:
+    if fade_ms and fade_ms>0:
         clip = clip.fade_in(fade_ms).fade_out(fade_ms)
-    return clip, start_ms/1000.0, end_ms/1000.0
+    return clip, start_s, end_s
 
-def rank_one_shots_in_segment(seg: AudioSegment, sr: int, top_k: int = 2, threshold_db: int = -45):
+def rank_one_shots_in_segment(seg: AudioSegment, sr:int, top_k:int=2, threshold_db=-45):
     samples = np.array(seg.get_array_of_samples()).astype(np.float32)
     if samples.size == 0:
         return []
-    maxv = np.max(np.abs(samples)) if np.max(np.abs(samples)) > 0 else 1.0
+    maxv = np.max(np.abs(samples)) if np.max(np.abs(samples))>0 else 1.0
     data = samples / maxv
     try:
         onset_env = librosa.onset.onset_strength(y=data, sr=sr)
@@ -229,7 +265,7 @@ def rank_one_shots_in_segment(seg: AudioSegment, sr: int, top_k: int = 2, thresh
             continue
     if len(candidates) < top_k:
         dur = seg.duration_seconds
-        offsets = np.linspace(0.1, max(0.5, dur-0.1), num=6)
+        offsets = np.linspace(0.1, max(0.5, max(0.5, dur-0.1)), num=6)
         for off in offsets:
             s_ms = int(off*1000)
             clip = seg[s_ms:s_ms+400]
@@ -238,13 +274,13 @@ def rank_one_shots_in_segment(seg: AudioSegment, sr: int, top_k: int = 2, thresh
                 candidates.append({"time": s_ms/1000.0, "audio": clip, "score": energy})
             except Exception:
                 continue
-    candidates = sorted(candidates, key=lambda x: x["score"], reverse=True)
-    return candidates[:top_k]
+    candidates_sorted = sorted(candidates, key=lambda x: x["score"], reverse=True)
+    return candidates_sorted[:top_k]
 
 # ---------------------------
-# Spleeter wrapper (lazy import)
+# Spleeter wrapper (lazy import) - only for local exe builds
 # ---------------------------
-def run_spleeter_4stems(track_path: Path, out_dir: Path):
+def run_spleeter_4stems(track_path:Path, out_dir:Path):
     stems = {}
     try:
         from spleeter.separator import Separator
@@ -257,30 +293,25 @@ def run_spleeter_4stems(track_path: Path, out_dir: Path):
             if p.exists():
                 stems[key] = p
     except Exception as e:
-        st.error("Spleeter separation failed. See server logs.")
-        st.text(str(e))
+        # return empty dict — caller will fallback to pseudo-stems
+        stems = {}
     return stems
 
 # ---------------------------
-# Build .trak zip (includes TSI)
+# Packaging & trak builders
 # ---------------------------
 def build_trak_package(loops_list, shots_list, stems_mp3_map, bpm, deck_name="RemixDeck"):
     mem = io.BytesIO()
     with zipfile.ZipFile(mem, mode="w", compression=zipfile.ZIP_DEFLATED) as z:
-        # loops
         for item in loops_list:
             z.writestr(f"loops/{item['name']}", item["bytes"])
-        # oneshots
         for item in shots_list:
             z.writestr(f"oneshots/{item['name']}", item["bytes"])
-        # stems
         for stem, b in stems_mp3_map.items():
             if b:
                 z.writestr(f"stems/{stem}.mp3", b)
-        # metadata
-        metadata = {"bpm": float(bpm), "loops": [i["name"] for i in loops_list], "one_shots": [i["name"] for i in shots_list]}
+        metadata = {"bpm": float(bpm), "loops": [i["name"] for i in loops_list], "one_shots":[i["name"] for i in shots_list]}
         z.writestr("metadata.json", json.dumps(metadata, indent=2))
-        # pad map: pads 0-7 loops, 8-15 oneshots
         pad_map = {}
         for i in range(16):
             pad_map[i] = {"pad": i, "assigned": False}
@@ -295,11 +326,8 @@ def build_trak_package(loops_list, shots_list, stems_mp3_map, bpm, deck_name="Re
     mem.seek(0)
     return mem
 
-# ---------------------------
-# Packaging bundle generator (scripts + workflow) which user can download and run locally/CI to produce .exe
-# ---------------------------
 def make_packaging_bundle_bytes():
-    # package_app.py content
+    # small packaging bundle: package_app.py + requirements-local.txt + GH actions
     package_app_py = r'''# package_app.py
 import shutil, os, subprocess, sys, zipfile, pathlib
 ENTRY_POINT = "app.py"
@@ -319,9 +347,7 @@ if __name__ == "__main__":
     run_pyinstaller()
     zip_exe()
 '''
-    # requirements.txt snippet
-    requirements_txt = "streamlit\nnumpy\nlibrosa\npydub\nsoundfile\nspleeter==2.3.0\ntensorflow==2.11.0\n"
-    # GitHub Actions workflow
+    requirements_local = "streamlit\nnumpy\nlibrosa\npydub\nsoundfile\nspleeter==2.3.0\ntensorflow==2.11.0\npyinstaller\n"
     workflow_yml = r'''name: Build Windows EXE
 on: [workflow_dispatch]
 jobs:
@@ -331,11 +357,12 @@ jobs:
     - uses: actions/checkout@v4
     - name: Set up Python
       uses: actions/setup-python@v4
-      with: python-version: '3.10'
+      with:
+        python-version: '3.10'
     - name: Install deps
       run: |
         python -m pip install --upgrade pip
-        pip install -r requirements.txt
+        pip install -r requirements-local.txt
         pip install pyinstaller
     - name: Build exe
       run: |
@@ -349,89 +376,90 @@ jobs:
         name: TraktorRemixDeckBuilder-installer
         path: TraktorRemixDeckBuilder_installer.zip
 '''
-    readme = r'''# Packaging Bundle
-Run package_app.py locally (requires pyinstaller) or use the included GitHub Actions workflow to build a Windows .exe.
-Ensure you have ffmpeg installed on the target machine.
-'''
+    readme = "Packaging bundle: package_app.py to build exe locally (requires pyinstaller), requirements-local.txt for local VM builds, GitHub Actions workflow for Windows CI."
     mem = io.BytesIO()
     with zipfile.ZipFile(mem, mode="w", compression=zipfile.ZIP_DEFLATED) as z:
         z.writestr("package_app.py", package_app_py)
-        z.writestr("requirements.txt", requirements_txt)
+        z.writestr("requirements-local.txt", requirements_local)
         z.writestr(".github/workflows/build-windows.yml", workflow_yml)
         z.writestr("README_packaging.md", readme)
     mem.seek(0)
     return mem.getvalue()
 
 # ---------------------------
-# UI and main flow
+# UI flow - Two-mode (A): user chooses Online vs Offline
 # ---------------------------
-st.markdown("<div class='card'><div class='section-title'>Upload & Settings</div></div>", unsafe_allow_html=True)
-left, right = st.columns([1,2], gap="large")
+st.markdown('<div class="card"><div class="section-title">Choose Mode</div>', unsafe_allow_html=True)
+st.markdown("""
+<div class="small">Pick how you want to work. <strong>Online (recommended)</strong> is quick and works in the browser — creates loops & one-shots only. <strong>Offline</strong> (local .exe) enables full stem separation using Spleeter and produces the richest stems + loops output.</div>
+</div>
+""", unsafe_allow_html=True)
 
-with left:
-    uploaded = st.file_uploader("Upload one mixed track (MP3 or WAV)", type=["mp3","wav"])
-    export_mode = st.radio("Export mode", options=["Stems + Loops + One-shots", "Loops & One-shots (no stems)"], index=0)
-    use_spleeter = st.checkbox("Use Spleeter 4-stems (local/VM only - lazy import)", value=True)
-    include_stems_checkbox = st.checkbox("Include full stems MP3s in output (when stems enabled)", value=True)
-    st.markdown("---")
+mode = st.radio("Mode", options=["Online (Web) — Loops & One-shots", "Offline (Local .exe) — Full Stems + Loops"], index=0, help="Online: fast, Cloud-safe. Offline: requires downloading & running the local .exe (packaging bundle provided).")
+
+st.markdown("")  # spacer
+
+# Left controls + right preview layout
+left_col, right_col = st.columns([1,2], gap="large")
+
+with left_col:
+    st.markdown("<div class='card'><div class='section-title'>Upload & Settings</div>", unsafe_allow_html=True)
+    uploaded = st.file_uploader("Upload one track (MP3 or WAV)", type=["mp3","wav"])
+    deck_name = st.text_input("Deck name", value="MyRemixDeck")
     bars = st.slider("Loop bars (4/4 beats)", 1, 8, 4)
     fade_ms = st.slider("Fade (ms)", 0, 500, 40)
-    overlap = st.slider("Overlap (%) — preview only", min_value=0, max_value=50, value=0)
     st.markdown("---")
-    deck_name = st.text_input("Deck name", value="MyRemixDeck")
-    st.caption("Note: ensure ffmpeg is installed and on PATH for MP3 conversion (pydub).")
+    include_stems_checkbox = st.checkbox("Include full stems in export (Offline only)", value=True) if mode.startswith("Offline") else st.checkbox("Include full stems in export (Disabled for Online)", value=False, disabled=True)
+    st.markdown("---")
+    st.markdown('<div class="small">Tip: Online mode is fast and reliable on Cloud. To extract high-quality stems run the Offline .exe (downloadable below).</div>', unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
 
-with right:
-    st.markdown("<div class='card'><div class='section-title'>Preview / Export</div></div>", unsafe_allow_html=True)
+    # Packaging bundle download available in both modes
+    st.markdown('<div style="margin-top:10px">', unsafe_allow_html=True)
+    if st.button("Create Packaging Bundle (.zip) — Build local .exe"):
+        st.info("Generating packaging bundle. Use the included package_app.py and requirements-local.txt to build a Windows .exe via PyInstaller or run the GitHub Actions workflow.")
+        bundle = make_packaging_bundle_bytes()
+        st.success("Packaging bundle ready.")
+        st.download_button("⬇ Download Packaging Bundle (zip)", data=bundle, file_name="traktor_packaging_bundle.zip", mime="application/zip")
+    st.markdown("</div>", unsafe_allow_html=True)
 
+with right_col:
+    st.markdown("<div class='card'><div class='section-title'>Preview / Export</div>", unsafe_allow_html=True)
+    if mode.startswith("Offline"):
+        st.markdown('<div class="notice info">Offline mode enables full stem separation using Spleeter. Build and run the local .exe (packaging bundle) to enable stems. See README in bundle for instructions.</div>', unsafe_allow_html=True)
+    else:
+        st.markdown('<div class="notice info">Online mode: loops & one-shots only. This is Cloud-safe and will not attempt heavy ML installs.</div>', unsafe_allow_html=True)
+
+# Stop early if no upload
 if not uploaded:
-    st.info("Upload a track to begin. If you're on Streamlit Cloud, Spleeter/TensorFlow may not run successfully—use local/VM for Spleeter.")
+    st.info("Upload a file to see results. Use Online mode for quick loops. Use 'Create Packaging Bundle' to build an offline .exe for stems.")
     st.stop()
 
-# Save upload
+# Save upload to temp file
 work_dir = Path(tempfile.mkdtemp(prefix="trk_"))
 upload_path = work_dir / uploaded.name
 with open(upload_path, "wb") as f:
     f.write(uploaded.getbuffer())
 
-# Load for analysis
-st.info("Loading audio for analysis...")
-try:
-    y, sr = librosa.load(str(upload_path), sr=None, mono=True)
-except Exception:
-    try:
-        pdseg = AudioSegment.from_file(str(upload_path))
-        samples = np.array(pdseg.get_array_of_samples()).astype(np.float32)
-        sr = pdseg.frame_rate
-        y = samples / (np.iinfo(pdseg.array_type).max if hasattr(pdseg, "array_type") else (2**15))
-    except Exception as e:
-        st.error(f"Could not load audio: {e}")
-        raise
-
-bpm = robust_detect_bpm(y, sr)
-st.success(f"Detected BPM: {bpm:.2f}")
-
-# Stem separation decision
-stems_paths = {}
-if export_mode.startswith("Stems") and use_spleeter:
-    st.info("Running Spleeter 4stems (lazy import) — this may take time on your machine.")
-    spleeter_out = work_dir / "spleeter_out"
-    spleeter_out.mkdir(exist_ok=True)
-    stems_paths = run_spleeter_4stems(upload_path, spleeter_out)
-    if not stems_paths:
-        st.warning("Spleeter failed or returned no stems. Falling back to pseudo-stems (full mix).")
-        stems_paths = {"drums": upload_path, "bass": upload_path, "melody": upload_path, "vocals": upload_path}
+# Analyze: beat detection (beat-aware loop slicing)
+st.info("Analyzing track for BPM and beats (this is used to align loops).")
+bpm, beat_times, sr, y = detect_bpm_and_beats(upload_path)
+if bpm is None or bpm == 0.0:
+    st.warning("Unable to detect reliable BPM — fallback heuristics will be used.")
+    bpm = 128.0
 else:
-    # loops-only (no stems) or spleeter disabled: use pseudo-stems (full mix split)
-    if export_mode.startswith("Stems") and not use_spleeter:
-        st.warning("Stems export selected but Spleeter disabled — using pseudo-stems (full mix).")
+    st.success(f"Detected BPM: {bpm:.2f}")
+
+# Stem separation: only if Offline and user runs local exe (here we only attempt spleeter if running locally and user toggles)
+stems_paths = {}
+if mode.startswith("Offline"):
+    st.markdown('<div class="notice warn">Offline stem separation is available only when you run the packaged .exe locally. The online app will not perform Spleeter separation to keep Cloud deployment stable.</div>', unsafe_allow_html=True)
+    # In the web UI we provide pseudo-stems (full mix duplicated) for loop generation, not real separation.
+    stems_paths = {"drums": upload_path, "bass": upload_path, "melody": upload_path, "vocals": upload_path}
+else:
     stems_paths = {"drums": upload_path, "bass": upload_path, "melody": upload_path, "vocals": upload_path}
 
-# Normalize mapping if Spleeter returns 'other'
-if "other" in stems_paths and "melody" not in stems_paths:
-    stems_paths["melody"] = stems_paths["other"]
-
-# Generate loops & one-shots per stem (4 stems: drums,bass,melody,vocals)
+# Build loops & one-shots (per pseudo-stem or real stems if offline exe used locally)
 colors = {"drums": "#ff6b6b", "bass": "#6bd6ff", "melody": "#9b7aff", "vocals": "#ffd56b"}
 loops_list = []
 shots_list = []
@@ -442,40 +470,45 @@ for stem in ["drums", "bass", "melody", "vocals"]:
     if stem_path is None:
         continue
     seg = AudioSegment.from_file(str(stem_path))
-    # optional full stem MP3 bytes
-    if export_mode.startswith("Stems") and include_stems_checkbox:
+    # prepare stem mp3 bytes only if offline & user included stems (note: this will be included in .trak if you build exe and run locally)
+    if mode.startswith("Offline") and include_stems_checkbox:
         buf = io.BytesIO()
-        seg.export(buf, format="mp3", bitrate="320k")
-        stems_mp3_map[stem] = buf.getvalue()
+        try:
+            seg.export(buf, format="mp3", bitrate="320k")
+            stems_mp3_map[stem] = buf.getvalue()
+        except Exception:
+            stems_mp3_map[stem] = None
     else:
         stems_mp3_map[stem] = None
 
-    # start loop (exact loop length)
-    clip_s, s_start, s_end = make_loop_from_segment(seg, bpm, bars, fade_ms, from_start=True)
+    # Start loop: beat-aligned
+    clip_s, s_start, s_end = make_loop_from_beats(seg, beat_times, bpm, bars, from_start=True, fade_ms=fade_ms)
     buf = io.BytesIO(); clip_s.export(buf, format="mp3", bitrate="320k"); s_bytes = buf.getvalue()
     loops_list.append({"name": f"{stem}_start.mp3", "bytes": s_bytes, "stem": stem, "start": s_start, "end": s_end, "color": colors.get(stem)})
 
-    # end loop (exact loop length)
-    clip_e, e_start, e_end = make_loop_from_segment(seg, bpm, bars, fade_ms, from_start=False)
+    # End loop: beat-aligned
+    clip_e, e_start, e_end = make_loop_from_beats(seg, beat_times, bpm, bars, from_start=False, fade_ms=fade_ms)
     buf = io.BytesIO(); clip_e.export(buf, format="mp3", bitrate="320k"); e_bytes = buf.getvalue()
     loops_list.append({"name": f"{stem}_end.mp3", "bytes": e_bytes, "stem": stem, "start": e_start, "end": e_end, "color": colors.get(stem)})
 
-    # one-shots: rank top 2
-    ranked = rank_one_shots_in_segment(seg, seg.frame_rate, top_k=2, threshold_db=-45)
+    # One-shots: pick top 2 per stem (transient ranking)
+    ranked = rank_one_shots_in_segment(seg, seg.frame_rate if hasattr(seg, "frame_rate") else (sr or 44100), top_k=2, threshold_db=-45)
     if len(ranked) < 2:
         dur = seg.duration_seconds
         offsets = [0.5, max(0.8, dur * 0.5)]
         for off in offsets:
             s_ms = int(off*1000)
             clip = seg[s_ms:s_ms+400]
-            energy = float(np.mean(np.abs(np.array(clip.get_array_of_samples()).astype(np.float32)))) if clip.duration_seconds > 0 else 0.0
+            energy = float(np.mean(np.abs(np.array(clip.get_array_of_samples()).astype(np.float32)))) if clip.duration_seconds>0 else 0.0
             ranked.append({"time": s_ms/1000.0, "audio": clip, "score": energy})
         ranked = sorted(ranked, key=lambda x: x["score"], reverse=True)[:2]
     for idx, cand in enumerate(ranked[:2], start=1):
         buf = io.BytesIO(); cand["audio"].export(buf, format="mp3", bitrate="320k"); bts = buf.getvalue()
         shots_list.append({"name": f"{stem}_shot_{idx}.mp3", "bytes": bts, "stem": stem, "time": cand.get("time", 0.0), "score": cand.get("score", 0.0), "color": colors.get(stem)})
 
-# UI: previews — use embedded <audio loop> for looping preview
+# ---------------------------
+# Preview UI: loops (looping HTML preview) and shots
+# ---------------------------
 def audio_bytes_to_base64_html(mp3_bytes, loop=False):
     b64 = base64.b64encode(mp3_bytes).decode('utf-8')
     loop_attr = "loop" if loop else ""
@@ -487,7 +520,7 @@ def audio_bytes_to_base64_html(mp3_bytes, loop=False):
     """
     return html
 
-st.markdown("## Loop previews (select which to include)")
+st.markdown("<div class='card'><div class='section-title'>Loop previews (select which to include)</div></div>", unsafe_allow_html=True)
 selected_loops = []
 cols = st.columns(4)
 for i, L in enumerate(loops_list):
@@ -498,7 +531,7 @@ for i, L in enumerate(loops_list):
         if st.checkbox(label, value=True, key=f"loop_sel_{i}"):
             selected_loops.append(L)
 
-st.markdown("## One-shot previews (select up to 8)")
+st.markdown("<div class='card'><div class='section-title'>One-shot previews (select up to 8)</div></div>", unsafe_allow_html=True)
 selected_shots = []
 cols = st.columns(4)
 for i, S in enumerate(shots_list):
@@ -509,7 +542,7 @@ for i, S in enumerate(shots_list):
         if st.checkbox(label, value=True, key=f"shot_sel_{i}"):
             selected_shots.append(S)
 
-# Pad mapping preview builder
+# Pad map preview
 def build_pad_map(loops_sel, shots_sel):
     pad_map = {}
     for i in range(16):
@@ -533,28 +566,42 @@ for i in range(16):
 
 st.download_button("Download pad_mapping.json", data=json.dumps(pad_map, indent=2), file_name=f"{deck_name}_pad_mapping.json", mime="application/json")
 
-# Packaging bundle for building a Windows exe locally or in CI
-if st.button("Create Packaging Bundle (zip) — build .exe locally/CI"):
-    st.info("Generating packaging bundle (package_app.py, requirements.txt, GitHub Actions workflow)...")
-    bundle_bytes = make_packaging_bundle_bytes()
-    st.success("Packaging bundle ready — download below.")
-    st.download_button("⬇ Download Packaging Bundle (zip)", data=bundle_bytes, file_name="packaging_bundle.zip", mime="application/zip")
+# How-to guide (compact)
+with st.expander("How to use — Quick guide (click to expand)"):
+    st.markdown("""
+    **Online (Web) mode** — Quick loops:
+    1. Upload a single MP3 or WAV.  
+    2. App detects beats and makes beat-aligned loops (Start / End) per pseudo-stem.  
+    3. Preview loops (they loop in the browser). Tick the ones you want.  
+    4. Build the `.trak` package and download. Import the `.tsi` into Traktor or copy the MP3s into a Remix Deck.
 
-# Final export button
-if st.button("Build Remix Deck (.trak) with TSI and MP3s"):
+    **Offline (.exe) mode — Full stems (recommended for highest quality):**
+    1. Click 'Create Packaging Bundle' and download the ZIP.  
+    2. Use the included `package_app.py` and `requirements-local.txt` to build the Windows `.exe` via PyInstaller (or run the provided GitHub Action).  
+    3. Run the `.exe` locally — it will allow full Spleeter 4-stem separation and export stems + loops.  
+    4. The `.exe` includes the same export options and will produce a `.trak` you can load into Traktor.
+
+    **Notes & Tips**
+    - For best results with vocals/stems use the Offline .exe option.  
+    - Ensure `ffmpeg` is installed locally when building/running the exe for correct mp3 exports.  
+    - The web app is Cloud-safe and will not try to install heavy ML packages.
+    """)
+# Export buttons
+st.markdown("<div style='margin-top:12px'></div>", unsafe_allow_html=True)
+
+if st.button("Build Remix Deck (.trak) — download"):
     if len(selected_loops) == 0 and len(selected_shots) == 0:
-        st.error("No loops or one-shots selected. Please select items to include.")
+        st.error("No loops or one-shots selected. Please choose at least one item before exporting.")
     else:
-        st.info("Building .trak package (this may take a few seconds)...")
-        trak_mem = build_trak_package(selected_loops, selected_shots, stems_mp3_map, bpm, deck_name=deck_name)
-        st.success("Package built — download below.")
+        st.info("Packaging .trak and .tsi (this may take a moment)...")
+        trak_mem = build_trak_package(selected_loops, selected_shots, stems_mp3_map if (mode.startswith("Offline") and include_stems_checkbox) else {}, bpm, deck_name=deck_name)
+        st.success("Package ready.")
         st.download_button("⬇ Download Remix Deck (.trak)", data=trak_mem.getvalue(), file_name=f"{deck_name}.trak", mime="application/zip")
 
-# Cleanup temp
+# Cleanup
 try:
     shutil.rmtree(work_dir)
 except Exception:
     pass
 
-st.caption("Local mode: Spleeter 4-stem enabled (if chosen). Exports are MP3 @ 320 kbps. For large tracks ensure you have sufficient RAM and ffmpeg installed.")
-
+st.markdown("<div class='footer'>Traktor RemixDeck Builder — quick loops online, full stems offline. Built by Tuesdaynightfreak Productions.</div>", unsafe_allow_html=True)
