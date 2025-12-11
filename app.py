@@ -1,14 +1,14 @@
 # app.py
 """
-Traktor RemixDeck Builder (Option A - Full Spleeter)
-- Full Spleeter 4-stem extraction (vocals, drums, bass, other -> melody)
-- Loop & one-shot extraction per stem (8 loops total, 8 one-shots total)
-- MP3 export at 320 kbps
-- .trak packaging with metadata.json, pad_mapping.json and generated deck_name.tsi (public-schema)
+Traktor RemixDeck Builder — Patched UI + looping previews + export modes + packaging bundle
+- Option A: Full Spleeter (local/VM). Lazy import to avoid boot crashes.
+- Export modes: "Stems + Loops + One-shots" or "Loops & One-shots (no stems)"
+- Fixed loop slicing and looping preview (browser <audio loop>)
+- Generates .trak (zip) with loops/oneshots/stems (optional) + metadata + pad_mapping.json + generated .tsi
+- Provides downloadable packaging bundle (scripts + workflow) to build a Windows .exe locally or with GitHub Actions
 Notes:
- - This is designed for LOCAL / VM deployment (Streamlit Cloud likely cannot run Spleeter/TensorFlow).
- - Ensure ffmpeg is installed on the machine and available on PATH.
- - requirements: streamlit, librosa, numpy, pydub, soundfile, spleeter==2.3.0, tensorflow (compatible)
+ - Requires ffmpeg on PATH for pydub -> mp3 export
+ - For Spleeter run locally: spleeter==2.3.0 and a compatible TensorFlow in requirements
 """
 import os
 import io
@@ -18,7 +18,9 @@ import tempfile
 import shutil
 from pathlib import Path
 import math
+import base64
 import streamlit as st
+import streamlit.components.v1 as components
 import numpy as np
 import librosa
 from pydub import AudioSegment
@@ -26,33 +28,73 @@ import xml.etree.ElementTree as ET
 from xml.dom import minidom
 
 # ---------------------------
-# Page config
+# Page config + env
 # ---------------------------
-st.set_page_config(page_title="Traktor RemixDeck Builder (Spleeter)", page_icon="🎧", layout="wide")
+st.set_page_config(page_title="Traktor RemixDeck Builder", page_icon="🎧", layout="wide")
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")  # reduce TF logs if TF present
 
 # ---------------------------
-# Small environment tweaks (optional)
+# Professional SVG logo + CSS (NI / Traktor inspired)
 # ---------------------------
-# These can reduce TF info logs. For local/GPU usage you may want to unset some of these.
-os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")  # reduce TF logs
+SVG_LOGO = r'''
+<svg width="110" height="110" viewBox="0 0 128 128" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Traktor RemixDeck Builder">
+  <defs>
+    <linearGradient id="lg" x1="0" x2="1">
+      <stop offset="0" stop-color="#18b7ff"/>
+      <stop offset="1" stop-color="#8f5aff"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="6" stdDeviation="12" flood-color="#000" flood-opacity="0.45"/>
+    </filter>
+  </defs>
+  <g filter="url(#shadow)">
+    <circle cx="64" cy="64" r="60" fill="url(#lg)"/>
+    <circle cx="64" cy="64" r="46" fill="#070809"/>
+    <g transform="translate(64,64)">
+      <circle r="18" fill="#0d0d0f" stroke="#1b1b1f" stroke-width="2"/>
+      <path d="M-26,-6 C-14,-8 -6,-4 0,-2 6,0 14,2 26,6" stroke="#cfefff" stroke-width="3" fill="none" stroke-linecap="round" opacity="0.9"/>
+    </g>
+    <rect x="12" y="12" width="16" height="6" rx="2" fill="#ffffff20" transform="rotate(-22 20 15)"/>
+    <rect x="100" y="110" width="12" height="6" rx="3" fill="#ffffff10" transform="rotate(-140 106 113)"/>
+  </g>
+</svg>
+'''
 
-# ---------------------------
-# UI styling (dark Traktor-like)
-# ---------------------------
-st.markdown("""
+st.markdown(
+    """
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap');
 html, body, [class*="css"] { font-family: 'Inter', sans-serif !important; background: linear-gradient(180deg,#07060a 0%, #0f0620 60%); color:#e6eef8; }
-.header { display:flex; gap:12px; align-items:center; padding:12px; }
-.title { font-size:26px; color:#19b7ff; font-weight:700; }
-.card { background: linear-gradient(180deg, rgba(255,255,255,0.015), rgba(255,255,255,0.01)); padding:12px; border-radius:10px; border:1px solid rgba(255,255,255,0.03); }
+.header { display:flex; gap:16px; align-items:center; padding:18px; }
+.app-title { font-size:28px; color:#18b7ff; font-weight:700; margin:0; }
+.app-sub { color:#cfefff; opacity:0.9; margin-top:2px; font-size:13px; }
+.card { background: linear-gradient(180deg, rgba(255,255,255,0.015), rgba(255,255,255,0.01)); padding:12px; border-radius:12px; border:1px solid rgba(255,255,255,0.025); box-shadow: 0 8px 30px rgba(2,6,23,0.55); }
 .preview-grid { display:grid; grid-template-columns: repeat(auto-fill,minmax(240px,1fr)); gap:12px; margin-top:12px; }
 .caption { color:#9fcff6; font-size:13px; opacity:0.95; margin-top:6px; }
 .pad { width:84px; height:84px; border-radius:8px; background:#0f0f14; border:1px solid rgba(255,255,255,0.03); display:flex; align-items:center; justify-content:center; color:#bfe9ff; }
 .pad.assigned { background: linear-gradient(135deg, rgba(10,132,255,0.06), rgba(155,90,255,0.04)); border:1px solid rgba(10,132,255,0.14); }
+.control-label { color:#cfefff; font-weight:600; }
+.section-title { color:#eaf6ff; font-size:16px; font-weight:700; margin-top:8px; }
 .small { font-size:13px; color:#9fcff6; }
+.btn { background: linear-gradient(90deg,#0a84ff,#2aa6ff); color:#041827; font-weight:600; border-radius:8px; padding:8px 14px; border: none; }
 </style>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
+
+# Header
+st.markdown(
+    f"""
+    <div class="header">
+      <div style="width:110px; height:110px">{SVG_LOGO}</div>
+      <div>
+        <div class="app-title">Traktor RemixDeck Builder</div>
+        <div class="app-sub">by Tuesdaynightfreak Productions — Stems, Loops, One-shots & Traktor-ready .trak/.tsi exports</div>
+      </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
 # ---------------------------
 # Helper: XML pretty print
@@ -73,10 +115,6 @@ def color_for_stem(stem_name: str) -> str:
     return "#9b7aff"  # melody/other
 
 def generate_tsi(pad_map: dict, sample_base_path: str, deck_name: str, bpm: float, comment: str = "") -> str:
-    """
-    pad_map: dict indexed 0..15 with entries:
-      { 'pad':i, 'assigned':True/False, 'sample_type':'loop'/'oneshot', 'file':'loops/..', 'loop':True/False, 'stem':..., 'start':..., 'end':... }
-    """
     root = ET.Element('TSI', {"version":"1.0"})
     info = ET.SubElement(root, "Info")
     ET.SubElement(info, "Name").text = deck_name
@@ -152,6 +190,7 @@ def robust_detect_bpm(y, sr):
     return 128.0
 
 def make_loop_from_segment(seg: AudioSegment, bpm: float, bars: int, fade_ms: int, from_start: bool = True):
+    # produce an exact loop-length clip (bars * 4 beats)
     beat = 60.0/float(bpm)
     loop_len_ms = int((bars * 4 * beat) * 1000)
     dur_ms = int(seg.duration_seconds * 1000)
@@ -167,14 +206,11 @@ def make_loop_from_segment(seg: AudioSegment, bpm: float, bars: int, fade_ms: in
     return clip, start_ms/1000.0, end_ms/1000.0
 
 def rank_one_shots_in_segment(seg: AudioSegment, sr: int, top_k: int = 2, threshold_db: int = -45):
-    # Convert to numpy mono
     samples = np.array(seg.get_array_of_samples()).astype(np.float32)
     if samples.size == 0:
         return []
-    # normalize
     maxv = np.max(np.abs(samples)) if np.max(np.abs(samples)) > 0 else 1.0
     data = samples / maxv
-    # compute onset envelope if feasible
     try:
         onset_env = librosa.onset.onset_strength(y=data, sr=sr)
         peaks = librosa.util.peak_pick(onset_env, pre_max=3, post_max=3, pre_avg=3, post_avg=3, delta=0.02, wait=3)
@@ -192,7 +228,6 @@ def rank_one_shots_in_segment(seg: AudioSegment, sr: int, top_k: int = 2, thresh
         except Exception:
             continue
     if len(candidates) < top_k:
-        # fallback sampling
         dur = seg.duration_seconds
         offsets = np.linspace(0.1, max(0.5, dur-0.1), num=6)
         for off in offsets:
@@ -210,13 +245,8 @@ def rank_one_shots_in_segment(seg: AudioSegment, sr: int, top_k: int = 2, thresh
 # Spleeter wrapper (lazy import)
 # ---------------------------
 def run_spleeter_4stems(track_path: Path, out_dir: Path):
-    """
-    Lazy-import Spleeter here to avoid importing TF at app startup.
-    Returns dict: { 'vocals': Path(...), 'drums': Path(...), 'bass': Path(...), 'other': Path(...) }
-    """
     stems = {}
     try:
-        # import here
         from spleeter.separator import Separator
         sep = Separator('spleeter:4stems')
         sep.separate_to_file(str(track_path), str(out_dir), codec='wav')
@@ -227,7 +257,7 @@ def run_spleeter_4stems(track_path: Path, out_dir: Path):
             if p.exists():
                 stems[key] = p
     except Exception as e:
-        st.error("Spleeter separation failed. See traceback in server logs.")
+        st.error("Spleeter separation failed. See server logs.")
         st.text(str(e))
     return stems
 
@@ -235,11 +265,6 @@ def run_spleeter_4stems(track_path: Path, out_dir: Path):
 # Build .trak zip (includes TSI)
 # ---------------------------
 def build_trak_package(loops_list, shots_list, stems_mp3_map, bpm, deck_name="RemixDeck"):
-    """
-    loops_list: list of dicts {name, bytes, stem, start, end, color}
-    shots_list: list of dicts {name, bytes, stem, time, score, color}
-    stems_mp3_map: dict stem->bytes or None
-    """
     mem = io.BytesIO()
     with zipfile.ZipFile(mem, mode="w", compression=zipfile.ZIP_DEFLATED) as z:
         # loops
@@ -259,39 +284,108 @@ def build_trak_package(loops_list, shots_list, stems_mp3_map, bpm, deck_name="Re
         pad_map = {}
         for i in range(16):
             pad_map[i] = {"pad": i, "assigned": False}
-        # fill loops up to 8
         for idx, L in enumerate(loops_list[:8]):
             pad_map[idx] = {"pad": idx, "assigned": True, "sample_type":"loop", "file": f"loops/{L['name']}", "loop": True, "stem": L.get("stem"), "start": L.get("start"), "end": L.get("end"), "color": L.get("color")}
-        # fill oneshots up to 8
         for idx, S in enumerate(shots_list[:8]):
             p = 8 + idx
             pad_map[p] = {"pad": p, "assigned": True, "sample_type":"oneshot", "file": f"oneshots/{S['name']}", "loop": False, "stem": S.get("stem"), "time": S.get("time"), "score": S.get("score"), "color": S.get("color")}
         z.writestr("pad_mapping.json", json.dumps(pad_map, indent=2))
-        # tsi
         tsi_text = generate_tsi(pad_map=pad_map, sample_base_path=".", deck_name=deck_name, bpm=bpm)
         z.writestr(f"{deck_name}.tsi", tsi_text.encode("utf-8"))
     mem.seek(0)
     return mem
 
 # ---------------------------
-# App flow
+# Packaging bundle generator (scripts + workflow) which user can download and run locally/CI to produce .exe
 # ---------------------------
-st.header("Traktor RemixDeck Builder — Full Stems (Spleeter)")
+def make_packaging_bundle_bytes():
+    # package_app.py content
+    package_app_py = r'''# package_app.py
+import shutil, os, subprocess, sys, zipfile, pathlib
+ENTRY_POINT = "app.py"
+DIST_NAME = "TraktorRemixDeckBuilder"
+def run_pyinstaller():
+    for d in ["build","dist"]:
+        if os.path.exists(d): shutil.rmtree(d)
+    cmd = [sys.executable, "-m", "PyInstaller", "--onefile", "--name", DIST_NAME, ENTRY_POINT]
+    subprocess.check_call(cmd)
+def zip_exe():
+    dist_exe = pathlib.Path("dist") / DIST_NAME
+    zip_name = f"{DIST_NAME}_installer.zip"
+    with zipfile.ZipFile(zip_name, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        z.write(dist_exe, arcname=f"{DIST_NAME}.exe")
+    print("Created", zip_name)
+if __name__ == "__main__":
+    run_pyinstaller()
+    zip_exe()
+'''
+    # requirements.txt snippet
+    requirements_txt = "streamlit\nnumpy\nlibrosa\npydub\nsoundfile\nspleeter==2.3.0\ntensorflow==2.11.0\n"
+    # GitHub Actions workflow
+    workflow_yml = r'''name: Build Windows EXE
+on: [workflow_dispatch]
+jobs:
+  build-windows-exe:
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with: python-version: '3.10'
+    - name: Install deps
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pyinstaller
+    - name: Build exe
+      run: |
+        pyinstaller --onefile --name TraktorRemixDeckBuilder app.py
+    - name: Zip artifact
+      run: |
+        powershell -Command "Compress-Archive -Path dist\\TraktorRemixDeckBuilder.exe -DestinationPath TraktorRemixDeckBuilder_installer.zip"
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: TraktorRemixDeckBuilder-installer
+        path: TraktorRemixDeckBuilder_installer.zip
+'''
+    readme = r'''# Packaging Bundle
+Run package_app.py locally (requires pyinstaller) or use the included GitHub Actions workflow to build a Windows .exe.
+Ensure you have ffmpeg installed on the target machine.
+'''
+    mem = io.BytesIO()
+    with zipfile.ZipFile(mem, mode="w", compression=zipfile.ZIP_DEFLATED) as z:
+        z.writestr("package_app.py", package_app_py)
+        z.writestr("requirements.txt", requirements_txt)
+        z.writestr(".github/workflows/build-windows.yml", workflow_yml)
+        z.writestr("README_packaging.md", readme)
+    mem.seek(0)
+    return mem.getvalue()
 
-# Controls
-col1, col2 = st.columns([1,1])
-with col1:
+# ---------------------------
+# UI and main flow
+# ---------------------------
+st.markdown("<div class='card'><div class='section-title'>Upload & Settings</div></div>", unsafe_allow_html=True)
+left, right = st.columns([1,2], gap="large")
+
+with left:
     uploaded = st.file_uploader("Upload one mixed track (MP3 or WAV)", type=["mp3","wav"])
-    use_spleeter = st.checkbox("Use Spleeter 4-stems (requires TF; local/VM only)", value=True)
-    include_stems_checkbox = st.checkbox("Include full stems MP3s in output", value=True)
-with col2:
-    bars = st.slider("Loop bars (4/4 bars)", 1, 8, 4)
+    export_mode = st.radio("Export mode", options=["Stems + Loops + One-shots", "Loops & One-shots (no stems)"], index=0)
+    use_spleeter = st.checkbox("Use Spleeter 4-stems (local/VM only - lazy import)", value=True)
+    include_stems_checkbox = st.checkbox("Include full stems MP3s in output (when stems enabled)", value=True)
+    st.markdown("---")
+    bars = st.slider("Loop bars (4/4 beats)", 1, 8, 4)
     fade_ms = st.slider("Fade (ms)", 0, 500, 40)
+    overlap = st.slider("Overlap (%) — preview only", min_value=0, max_value=50, value=0)
+    st.markdown("---")
     deck_name = st.text_input("Deck name", value="MyRemixDeck")
-    st.write("All exported audio will be MP3 @ 320 kbps.")
+    st.caption("Note: ensure ffmpeg is installed and on PATH for MP3 conversion (pydub).")
+
+with right:
+    st.markdown("<div class='card'><div class='section-title'>Preview / Export</div></div>", unsafe_allow_html=True)
 
 if not uploaded:
-    st.info("Upload a track to begin (Spleeter import is lazy and only runs after upload).")
+    st.info("Upload a track to begin. If you're on Streamlit Cloud, Spleeter/TensorFlow may not run successfully—use local/VM for Spleeter.")
     st.stop()
 
 # Save upload
@@ -300,7 +394,7 @@ upload_path = work_dir / uploaded.name
 with open(upload_path, "wb") as f:
     f.write(uploaded.getbuffer())
 
-# Load audio for analysis
+# Load for analysis
 st.info("Loading audio for analysis...")
 try:
     y, sr = librosa.load(str(upload_path), sr=None, mono=True)
@@ -317,25 +411,27 @@ except Exception:
 bpm = robust_detect_bpm(y, sr)
 st.success(f"Detected BPM: {bpm:.2f}")
 
-# Stem separation
+# Stem separation decision
 stems_paths = {}
-if use_spleeter:
-    st.info("Running Spleeter 4-stem separation (this may take a minute or more depending on your machine)...")
+if export_mode.startswith("Stems") and use_spleeter:
+    st.info("Running Spleeter 4stems (lazy import) — this may take time on your machine.")
     spleeter_out = work_dir / "spleeter_out"
     spleeter_out.mkdir(exist_ok=True)
     stems_paths = run_spleeter_4stems(upload_path, spleeter_out)
     if not stems_paths:
-        st.warning("Spleeter returned no stems — falling back to full mix as pseudo-stems. Check logs for errors.")
+        st.warning("Spleeter failed or returned no stems. Falling back to pseudo-stems (full mix).")
         stems_paths = {"drums": upload_path, "bass": upload_path, "melody": upload_path, "vocals": upload_path}
 else:
-    st.info("Spleeter disabled — using full mix as pseudo-stems.")
+    # loops-only (no stems) or spleeter disabled: use pseudo-stems (full mix split)
+    if export_mode.startswith("Stems") and not use_spleeter:
+        st.warning("Stems export selected but Spleeter disabled — using pseudo-stems (full mix).")
     stems_paths = {"drums": upload_path, "bass": upload_path, "melody": upload_path, "vocals": upload_path}
 
-# Normalize keys: map 'other' -> 'melody'
+# Normalize mapping if Spleeter returns 'other'
 if "other" in stems_paths and "melody" not in stems_paths:
     stems_paths["melody"] = stems_paths["other"]
 
-# Build loops and shots per stem
+# Generate loops & one-shots per stem (4 stems: drums,bass,melody,vocals)
 colors = {"drums": "#ff6b6b", "bass": "#6bd6ff", "melody": "#9b7aff", "vocals": "#ffd56b"}
 loops_list = []
 shots_list = []
@@ -345,29 +441,27 @@ for stem in ["drums", "bass", "melody", "vocals"]:
     stem_path = stems_paths.get(stem)
     if stem_path is None:
         continue
-    # load AudioSegment from path
     seg = AudioSegment.from_file(str(stem_path))
-    # full stem -> mp3 bytes (if included)
-    if include_stems_checkbox:
-        bbuf = io.BytesIO()
-        seg.export(bbuf, format="mp3", bitrate="320k")
-        stems_mp3_map[stem] = bbuf.getvalue()
+    # optional full stem MP3 bytes
+    if export_mode.startswith("Stems") and include_stems_checkbox:
+        buf = io.BytesIO()
+        seg.export(buf, format="mp3", bitrate="320k")
+        stems_mp3_map[stem] = buf.getvalue()
     else:
         stems_mp3_map[stem] = None
 
-    # Start loop
-    clip_start, s_start, s_end = make_loop_from_segment(seg, bpm, bars, fade_ms, from_start=True)
-    buf = io.BytesIO(); clip_start.export(buf, format="mp3", bitrate="320k"); start_bytes = buf.getvalue()
-    loops_list.append({"name": f"{stem}_start.mp3", "bytes": start_bytes, "stem": stem, "start": s_start, "end": s_end, "color": colors.get(stem)})
+    # start loop (exact loop length)
+    clip_s, s_start, s_end = make_loop_from_segment(seg, bpm, bars, fade_ms, from_start=True)
+    buf = io.BytesIO(); clip_s.export(buf, format="mp3", bitrate="320k"); s_bytes = buf.getvalue()
+    loops_list.append({"name": f"{stem}_start.mp3", "bytes": s_bytes, "stem": stem, "start": s_start, "end": s_end, "color": colors.get(stem)})
 
-    # End loop
-    clip_end, e_start, e_end = make_loop_from_segment(seg, bpm, bars, fade_ms, from_start=False)
-    buf = io.BytesIO(); clip_end.export(buf, format="mp3", bitrate="320k"); end_bytes = buf.getvalue()
-    loops_list.append({"name": f"{stem}_end.mp3", "bytes": end_bytes, "stem": stem, "start": e_start, "end": e_end, "color": colors.get(stem)})
+    # end loop (exact loop length)
+    clip_e, e_start, e_end = make_loop_from_segment(seg, bpm, bars, fade_ms, from_start=False)
+    buf = io.BytesIO(); clip_e.export(buf, format="mp3", bitrate="320k"); e_bytes = buf.getvalue()
+    loops_list.append({"name": f"{stem}_end.mp3", "bytes": e_bytes, "stem": stem, "start": e_start, "end": e_end, "color": colors.get(stem)})
 
-    # One-shots: rank top 2
+    # one-shots: rank top 2
     ranked = rank_one_shots_in_segment(seg, seg.frame_rate, top_k=2, threshold_db=-45)
-    # Ensure at least 2 candidates
     if len(ranked) < 2:
         dur = seg.duration_seconds
         offsets = [0.5, max(0.8, dur * 0.5)]
@@ -377,18 +471,29 @@ for stem in ["drums", "bass", "melody", "vocals"]:
             energy = float(np.mean(np.abs(np.array(clip.get_array_of_samples()).astype(np.float32)))) if clip.duration_seconds > 0 else 0.0
             ranked.append({"time": s_ms/1000.0, "audio": clip, "score": energy})
         ranked = sorted(ranked, key=lambda x: x["score"], reverse=True)[:2]
-    # add top 2
     for idx, cand in enumerate(ranked[:2], start=1):
         buf = io.BytesIO(); cand["audio"].export(buf, format="mp3", bitrate="320k"); bts = buf.getvalue()
         shots_list.append({"name": f"{stem}_shot_{idx}.mp3", "bytes": bts, "stem": stem, "time": cand.get("time", 0.0), "score": cand.get("score", 0.0), "color": colors.get(stem)})
 
-# Present previews and selection checkboxes
+# UI: previews — use embedded <audio loop> for looping preview
+def audio_bytes_to_base64_html(mp3_bytes, loop=False):
+    b64 = base64.b64encode(mp3_bytes).decode('utf-8')
+    loop_attr = "loop" if loop else ""
+    html = f"""
+    <audio controls {loop_attr} style="width:100%">
+      <source src="data:audio/mp3;base64,{b64}" type="audio/mp3">
+      Your browser does not support the audio element.
+    </audio>
+    """
+    return html
+
 st.markdown("## Loop previews (select which to include)")
 selected_loops = []
 cols = st.columns(4)
 for i, L in enumerate(loops_list):
     with cols[i % 4]:
-        st.audio(L["bytes"], format="audio/mp3")
+        html = audio_bytes_to_base64_html(L["bytes"], loop=True)
+        components.html(html, height=80)
         label = f"{L['stem'].upper()} {'START' if 'start' in L['name'] else 'END'} — {L['start']:.2f}s → {L['end']:.2f}s"
         if st.checkbox(label, value=True, key=f"loop_sel_{i}"):
             selected_loops.append(L)
@@ -398,20 +503,19 @@ selected_shots = []
 cols = st.columns(4)
 for i, S in enumerate(shots_list):
     with cols[i % 4]:
-        st.audio(S["bytes"], format="audio/mp3")
+        html = audio_bytes_to_base64_html(S["bytes"], loop=False)
+        components.html(html, height=80)
         label = f"{S['stem'].upper()} shot #{(i%2)+1} (score {S['score']:.3g})"
         if st.checkbox(label, value=True, key=f"shot_sel_{i}"):
             selected_shots.append(S)
 
-# Pad mapping preview
+# Pad mapping preview builder
 def build_pad_map(loops_sel, shots_sel):
     pad_map = {}
     for i in range(16):
         pad_map[i] = {"pad": i, "assigned": False}
-    # fill pads 0..7 with loops (order: as in loops_sel)
     for idx, L in enumerate(loops_sel[:8]):
         pad_map[idx] = {"pad": idx, "assigned": True, "sample_type":"loop", "file": f"loops/{L['name']}", "loop": True, "stem": L.get("stem"), "start": L.get("start"), "end": L.get("end"), "color": L.get("color")}
-    # fill pads 8..15 with shots
     for idx, S in enumerate(shots_sel[:8]):
         p = 8 + idx
         pad_map[p] = {"pad": p, "assigned": True, "sample_type":"oneshot", "file": f"oneshots/{S['name']}", "loop": False, "stem": S.get("stem"), "time": S.get("time"), "score": S.get("score"), "color": S.get("color")}
@@ -429,6 +533,13 @@ for i in range(16):
 
 st.download_button("Download pad_mapping.json", data=json.dumps(pad_map, indent=2), file_name=f"{deck_name}_pad_mapping.json", mime="application/json")
 
+# Packaging bundle for building a Windows exe locally or in CI
+if st.button("Create Packaging Bundle (zip) — build .exe locally/CI"):
+    st.info("Generating packaging bundle (package_app.py, requirements.txt, GitHub Actions workflow)...")
+    bundle_bytes = make_packaging_bundle_bytes()
+    st.success("Packaging bundle ready — download below.")
+    st.download_button("⬇ Download Packaging Bundle (zip)", data=bundle_bytes, file_name="packaging_bundle.zip", mime="application/zip")
+
 # Final export button
 if st.button("Build Remix Deck (.trak) with TSI and MP3s"):
     if len(selected_loops) == 0 and len(selected_shots) == 0:
@@ -441,10 +552,9 @@ if st.button("Build Remix Deck (.trak) with TSI and MP3s"):
 
 # Cleanup temp
 try:
-    # keep workspace tidy
     shutil.rmtree(work_dir)
 except Exception:
     pass
 
-st.caption("Local mode: Spleeter 4-stem enabled. Exports are MP3 @ 320 kbps. For large tracks ensure you have sufficient RAM. ")
+st.caption("Local mode: Spleeter 4-stem enabled (if chosen). Exports are MP3 @ 320 kbps. For large tracks ensure you have sufficient RAM and ffmpeg installed.")
 
