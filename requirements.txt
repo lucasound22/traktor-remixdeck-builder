@@ -3,5 +3,3 @@ numpy
 librosa
 pydub
 soundfile
-spleeter==2.3.0
-tensorflow==2.11.0
